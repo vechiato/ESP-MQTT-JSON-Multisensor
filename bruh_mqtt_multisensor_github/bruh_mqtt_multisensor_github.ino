@@ -18,7 +18,7 @@
       - DHT sensor library 
       - Adafruit unified sensor
       - PubSubClient
-      - ArduinoJSON
+      - ArduinoJSON 5.x
 	  
   UPDATE 16 MAY 2017 by Knutella - Fixed MQTT disconnects when wifi drops by moving around Reconnect and adding a software reset of MCU
 	           
@@ -26,21 +26,25 @@
   
   UPDATE 27 NOV 2017 - Changed HeatIndex to built in function of DHT library. Added definition for fahrenheit or celsius
 
+  UPDATE 10 DEC 2020 - fixing probing interval for DHT sensor and LDR to 2seconds 
+
+  UPDATE 13 Dec 2020 - Switching to DHTesp https://github.com/beegee-tokyo/DHTesp over DHT library, implementing DewPoint and ComfortStatus  
+
 */
 
 
 
 #include <ESP8266WiFi.h>
-#include <DHT.h>
+//#include <DHT.h>
+#include <DHTesp.h>
 #include <PubSubClient.h>
 #include <ESP8266mDNS.h>
 #include <WiFiUdp.h>
 #include <ArduinoOTA.h>
 #include <ArduinoJson.h>
 
-
 /************ TEMP SETTINGS (CHANGE THIS FOR YOUR SETUP) *******************************/
-#define IsFahrenheit true //to use celsius change to false
+#define IsFahrenheit false //to use celsius change to false
 
 /************ WIFI and MQTT INFORMATION (CHANGE THESE FOR YOUR SETUP) ******************/
 #define wifi_ssid "YourSSID" //type your WIFI information inside the quotes
@@ -50,8 +54,6 @@
 #define mqtt_password "yourMQTTpassword"
 #define mqtt_port 1883
 
-
-
 /************* MQTT TOPICS (change these topics as you wish)  **************************/
 #define light_state_topic "bruh/sensornode1"
 #define light_set_topic "bruh/sensornode1/set"
@@ -59,14 +61,10 @@
 const char* on_cmd = "ON";
 const char* off_cmd = "OFF";
 
-
-
 /**************************** FOR OTA **************************************************/
 #define SENSORNAME "sensornode1"
 #define OTApassword "YouPassword" // change this to whatever password you want to use when you upload OTA
 int OTAport = 8266;
-
-
 
 /**************************** PIN DEFINITIONS ********************************************/
 const int redPin = D1;
@@ -76,8 +74,6 @@ const int bluePin = D3;
 #define DHTPIN    D7
 #define DHTTYPE   DHT22
 #define LDRPIN    A0
-
-
 
 /**************************** SENSOR DEFINITIONS *******************************************/
 float ldrValue;
@@ -98,11 +94,11 @@ String motionStatus;
 char message_buff[100];
 
 int calibrationTime = 0;
+int dhtprobeinterval = 0;
 
 const int BUFFER_SIZE = 300;
 
 #define MQTT_MAX_PACKET_SIZE 512
-
 
 /******************************** GLOBALS for fade/flash *******************************/
 byte red = 255;
@@ -134,11 +130,9 @@ byte flashBlue = blue;
 byte flashBrightness = brightness;
 
 
-
 WiFiClient espClient;
 PubSubClient client(espClient);
-DHT dht(DHTPIN, DHTTYPE);
-
+DHTesp dht;
 
 
 /********************************** START SETUP*****************************************/
@@ -151,6 +145,9 @@ void setup() {
   pinMode(LDRPIN, INPUT);
 
   Serial.begin(115200);
+  //dht.begin();
+  dht.setup(DHTPIN, DHTesp::DHT22); 
+
   delay(10);
 
   ArduinoOTA.setPort(OTAport);
@@ -336,6 +333,39 @@ bool processJson(char* message) {
 }
 
 
+// convert comfort status to string
+String comfortString(int cf) {
+    String comfortStatus = "";
+    String comfort;
+    switch(cf) {
+       case 0:
+        comfortStatus = "Dry";
+        break;
+      case 1:
+        comfortStatus = "Very comfortable";
+        break;
+      case 2:
+        comfortStatus = "Comfortable";
+        break;
+      case 3:
+        comfortStatus = "OK";
+        break;
+      case 4:
+        comfortStatus = "Uncomfortable";
+        break;
+      case 5:
+        comfortStatus = "Quite uncomfortable";
+        break;  
+      case 6:
+        comfortStatus = "Very uncomfortable";
+      case 7:
+        comfortStatus = "Severe uncomfortable";
+      default:
+        comfortStatus = "Unknown:";
+        break;
+    };
+  return comfortStatus;
+}
 
 /********************************** START SEND STATE*****************************************/
 void sendState() {
@@ -356,15 +386,24 @@ void sendState() {
   root["ldr"] = (String)LDR;
   root["temperature"] = (String)tempValue;
   root["heatIndex"] = (String)dht.computeHeatIndex(tempValue, humValue, IsFahrenheit);
-
+  root["dewPoint"] = (String)dht.computeDewPoint(tempValue, humValue, IsFahrenheit);
+  root["comfortStatus"] = (String)comfortString(dht.computePerception(tempValue,  humValue, IsFahrenheit));
+  //root["computePerception"] = (String)dht.computePerception(tempValue,  humValue, IsFahrenheit);
+ 
 
   char buffer[root.measureLength() + 1];
   root.printTo(buffer, sizeof(buffer));
 
-  Serial.println(buffer);
-  client.publish(light_state_topic, buffer, true);
-}
+  if (humValue > 0) {
+    Serial.print("Sendind data ");
+    Serial.println(buffer);
 
+    client.publish(light_state_topic, buffer, true);
+  } else {
+    Serial.print("Sensor not ready yet ");
+    Serial.println(buffer);
+  }
+}
 
 
 /********************************** START SET COLOR *****************************************/
@@ -381,7 +420,6 @@ void setColor(int inR, int inG, int inB) {
   Serial.print(", b: ");
   Serial.println(inB);
 }
-
 
 
 /********************************** START RECONNECT*****************************************/
@@ -406,7 +444,6 @@ void reconnect() {
 }
 
 
-
 /********************************** START CHECK SENSOR **********************************/
 bool checkBoundSensor(float newValue, float prevValue, float maxDiff) {
   return newValue < prevValue - maxDiff || newValue > prevValue + maxDiff;
@@ -426,44 +463,67 @@ void loop() {
 
   if (!inFade) {
 
-    float newTempValue = dht.readTemperature(IsFahrenheit);
-    float newHumValue = dht.readHumidity();
+    // measuring delay
+    delay(100);
+    dhtprobeinterval +=100;
 
     //PIR CODE
     pirValue = digitalRead(PIRPIN); //read state of the
-
     if (pirValue == LOW && pirStatus != 1) {
       motionStatus = "standby";
       sendState();
       pirStatus = 1;
     }
-
     else if (pirValue == HIGH && pirStatus != 2) {
       motionStatus = "motion detected";
       sendState();
       pirStatus = 2;
     }
 
-    delay(100);
+    //delay(dht.getMinimumSamplingPeriod()); 
+    if (dhtprobeinterval > 2000){
+      dhtprobeinterval = 0; 
+      Serial.println("probing"); 
+   
+      int newLDR = analogRead(LDRPIN);
+        
+      if ((checkBoundSensor(newLDR, LDR, diffLDR)) && (newLDR != LDR)) {
+          if (newLDR > 0) {
+            LDR = newLDR;
+            sendState();
+          } else {
+            Serial.println("ldr still wrong");
+          }
+      }
 
-    if (checkBoundSensor(newTempValue, tempValue, diffTEMP)) {
-      tempValue = newTempValue;
-      sendState();
+      float newHumValue = dht.getHumidity();
+      float newTempValue = dht.getTemperature();
+  
+      if (isnan(newTempValue) || isnan(newHumValue)) {
+         Serial.println("Failed to read from DHT sensor!");
+         return;
+      }
+   
+      if (newTempValue != tempValue) {
+        Serial.print(newTempValue);
+        Serial.print(" ");
+        Serial.print(tempValue);
+        if ((checkBoundSensor(newTempValue, tempValue, diffTEMP))) {
+          if ((tempValue == 0 || (abs(newTempValue - tempValue) < 3))) {
+            tempValue = newTempValue;
+            sendState();
+          }
+        } 
+      }
+  
+      if ((checkBoundSensor(newHumValue, humValue, diffHUM)) && (newHumValue != humValue)) {
+          if (newHumValue > 0 && newHumValue < 101) {
+            humValue = newHumValue;
+            sendState();
+          } 
+      }
+
     }
-
-    if (checkBoundSensor(newHumValue, humValue, diffHUM)) {
-      humValue = newHumValue;
-      sendState();
-    }
-
-
-    int newLDR = analogRead(LDRPIN);
-
-    if (checkBoundSensor(newLDR, LDR, diffLDR)) {
-      LDR = newLDR;
-      sendState();
-    }
-
   }
 
   if (flash) {
