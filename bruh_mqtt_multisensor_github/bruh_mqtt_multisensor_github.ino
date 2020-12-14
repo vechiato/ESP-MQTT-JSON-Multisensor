@@ -27,7 +27,7 @@
   UPDATE 27 NOV 2017 - Changed HeatIndex to built in function of DHT library. Added definition for fahrenheit or celsius
 
   UPDATE 10 DEC 2020 - fixing probing interval for DHT sensor and LDR to 2seconds 
-
+  
   UPDATE 13 Dec 2020 - Switching to DHTesp https://github.com/beegee-tokyo/DHTesp over DHT library, implementing DewPoint and ComfortStatus  
 
 */
